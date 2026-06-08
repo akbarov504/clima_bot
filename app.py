@@ -80,7 +80,7 @@ def get_new_leads(token: str) -> list[dict]:
         res.raise_for_status()
         data = res.json()
         all_leads = data.get("result", [])
-        new_leads = [l for l in all_leads if l.get("status") == "NEW"]
+        new_leads = [l for l in all_leads if l.get("status") == "NEW" and l.get("phone_number") is not None and l.get("full_name") is not None]
         logger.info(f"Jami: {len(all_leads)}, NEW: {len(new_leads)}")
         return new_leads
     except Exception as e:
