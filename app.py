@@ -24,21 +24,20 @@ PATCH_API     = f"{BASE_URL}/company_lid"
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher(bot)
 
-admin_groups: set[int] = set()
+admin_groups: dict[int, int | None] = {}
 
 _token_cache = {
     "access_token":  None,
     "refresh_token": None,
     "expires_at":    0,
 }
-
 TOKEN_TTL = 23 * 60 * 60
 
 def _login() -> bool:
     try:
         res = requests.post(GET_TOKEN_API, json=AUTH_DATA, timeout=10)
         res.raise_for_status()
-        data = res.json()
+        data   = res.json()
         result = data.get("result", {})
         access  = result.get("access_token")
         refresh = result.get("refresh_token")
@@ -55,19 +54,13 @@ def _login() -> bool:
         return False
 
 def get_token() -> str | None:
-    now = time.time()
-    remaining = _token_cache["expires_at"] - now
-
+    remaining = _token_cache["expires_at"] - time.time()
     if _token_cache["access_token"] and remaining > 0:
-        hours = int(remaining // 3600)
-        mins  = int((remaining % 3600) // 60)
-        logger.info(f"♻️  Keshdan token ishlatildi (qoldi: {hours}s {mins}d)")
+        h, m = int(remaining // 3600), int((remaining % 3600) // 60)
+        logger.info(f"♻️  Keshdan token (qoldi: {h}s {m}d)")
         return _token_cache["access_token"]
-
-    logger.info("🔄 Token muddati tugagan, qayta login...")
-    if _login():
-        return _token_cache["access_token"]
-    return None
+    logger.info("🔄 Token yangilanmoqda...")
+    return _token_cache["access_token"] if _login() else None
 
 async def refresh_token_daily():
     logger.info("🌅 Kunlik token yangilash...")
@@ -78,9 +71,8 @@ def get_new_leads(token: str) -> list[dict]:
         headers = {"Authorization": f"Bearer {token}"}
         res = requests.get(GET_DATA_API, headers=headers, timeout=10)
         res.raise_for_status()
-        data = res.json()
-        all_leads = data.get("result", [])
-        new_leads = [l for l in all_leads if l.get("status") == "NEW" and l.get("phone_number") is not None and l.get("full_name") is not None]
+        all_leads = res.json().get("result", [])
+        new_leads = [l for l in all_leads if l.get("status") == "NEW"]
         logger.info(f"Jami: {len(all_leads)}, NEW: {len(new_leads)}")
         return new_leads
     except Exception as e:
@@ -90,26 +82,25 @@ def get_new_leads(token: str) -> list[dict]:
 def mark_as_interested(token: str, lid_id: int) -> bool:
     try:
         headers = {"Authorization": f"Bearer {token}"}
-        body = {"status": "INTERESTED", "message": ""}
-        res = requests.patch(f"{PATCH_API}/{lid_id}", json=body, headers=headers, timeout=10)
+        res = requests.patch(
+            f"{PATCH_API}/{lid_id}",
+            json={"status": "INTERESTED", "message": ""},
+            headers=headers, timeout=10
+        )
         res.raise_for_status()
         logger.info(f"Lead #{lid_id} → INTERESTED")
         return True
     except Exception as e:
-        logger.error(f"Status o'zgartirishda xato (#{lid_id}): {e}")
+        logger.error(f"Status xato (#{lid_id}): {e}")
         return False
 
 def format_lead(lead: dict) -> str:
-    lid_id    = lead.get("id", "—")
-    full_name = lead.get("full_name") or "—"
-    phone     = lead.get("phone_number") or "—"
-    username  = lead.get("username") or "—"
     return (
         f"🔔 <b>Yangi Lead!</b>\n\n"
-        f"🆔 ID: <code>{lid_id}</code>\n"
-        f"👤 Ism: <b>{full_name}</b>\n"
-        f"📞 Telefon: <code>{phone}</code>\n"
-        f"📸 Instagram: @{username}"
+        f"🆔 ID: <code>{lead.get('id', '—')}</code>\n"
+        f"👤 Ism: <b>{lead.get('full_name') or '—'}</b>\n"
+        f"📞 Telefon: <code>{lead.get('phone_number') or '—'}</code>\n"
+        f"📸 Instagram: @{lead.get('username') or '—'}"
     )
 
 async def send_leads_to_groups():
@@ -118,25 +109,27 @@ async def send_leads_to_groups():
 
     token = get_token()
     if not token:
-        logger.error("Token olinmadi")
         return
 
     leads = get_new_leads(token)
     if not leads:
         return
 
-    logger.info(f"{len(leads)} ta lead → {len(admin_groups)} ta guruh")
-
     for lead in leads:
         lid_id = lead.get("id")
         text   = format_lead(lead)
 
-        for chat_id in list(admin_groups):
+        for chat_id, thread_id in list(admin_groups.items()):
             try:
-                await bot.send_message(chat_id, text, parse_mode="HTML")
+                await bot.send_message(
+                    chat_id,
+                    text,
+                    parse_mode="HTML",
+                    message_thread_id=thread_id
+                )
                 await asyncio.sleep(0.3)
             except Exception as e:
-                logger.error(f"Guruhga yuborishda xato ({chat_id}): {e}")
+                logger.error(f"Yuborishda xato ({chat_id}, thread={thread_id}): {e}")
 
         if lid_id:
             mark_as_interested(token, lid_id)
@@ -155,15 +148,17 @@ async def on_chat_member_update(update: types.ChatMemberUpdated):
     if new_status in ("administrator", "member"):
         await check_and_add_group(chat_id)
     elif new_status in ("left", "kicked"):
-        admin_groups.discard(chat_id)
-        logger.info(f"Guruhdan chiqarildi: {chat_id}")
+        if chat_id in admin_groups:
+            del admin_groups[chat_id]
+            logger.info(f"Guruhdan chiqarildi: {chat_id}")
 
 async def check_and_add_group(chat_id: int):
     try:
         bot_info = await bot.get_me()
         member   = await bot.get_chat_member(chat_id, bot_info.id)
         if member.status == "administrator":
-            admin_groups.add(chat_id)
+            if chat_id not in admin_groups:
+                admin_groups[chat_id] = None
             logger.info(f"Admin guruh qo'shildi: {chat_id}")
     except Exception as e:
         logger.error(f"Guruhni tekshirishda xato ({chat_id}): {e}")
@@ -172,29 +167,98 @@ async def check_and_add_group(chat_id: int):
 async def cmd_start(message: types.Message):
     await message.reply(
         "👋 <b>Leads Bot</b>\n\n"
-        "Har <b>1 daqiqada</b> Instagram leadlarini olib,\n"
-        "admin guruhlariga yuboraman.\n\n"
-        "✅ Meni guruhga <b>admin</b> qilib qo'shing.",
+        "Har <b>1 daqiqada</b> NEW leadlarni tekshirib guruhga yuboraman.\n\n"
+        "📌 Komandalar:\n"
+        "/set_topic — shu topicni lead topici qilib belgilash\n"
+        "/remove_topic — topicni o'chirib General ga qaytarish\n"
+        "/status — bot holati\n"
+        "/send_now — hozir yuborish",
         parse_mode="HTML"
     )
 
+@dp.message_handler(commands=["set_topic"])
+async def cmd_set_topic(message: types.Message):
+    """Shu topic ichida yozilsa — shu topicni belgilaydi"""
+    chat_id   = message.chat.id
+    thread_id = message.message_thread_id  # Topic ichida bo'lsa ID keladi
+
+    if message.chat.type not in ("group", "supergroup"):
+        await message.reply("⚠️ Bu komanda faqat guruhda ishlaydi.")
+        return
+
+    if chat_id not in admin_groups:
+        await check_and_add_group(chat_id)
+
+    if chat_id not in admin_groups:
+        await message.reply("❌ Men bu guruhda admin emasman. Avval admin qilib qo'ying.")
+        return
+
+    if not thread_id:
+        await message.reply(
+            "ℹ️ Hozir <b>General</b> da turibsiz.\n\n"
+            "Leadlarni biror topicga yuborish uchun:\n"
+            "1. Kerakli topicni oching\n"
+            "2. O'sha yerda /set_topic yozing\n\n"
+            "Yoki /remove_topic — General da qoldirasiz.",
+            parse_mode="HTML"
+        )
+        return
+
+    admin_groups[chat_id] = thread_id
+    await message.reply(
+        f"✅ <b>Topic belgilandi!</b>\n\n"
+        f"Endi leadlar faqat shu topicga keladi.\n"
+        f"🧵 Thread ID: <code>{thread_id}</code>\n\n"
+        f"Bekor qilish: /remove_topic",
+        parse_mode="HTML"
+    )
+    logger.info(f"Guruh {chat_id} → topic {thread_id} belgilandi")
+
+@dp.message_handler(commands=["remove_topic"])
+async def cmd_remove_topic(message: types.Message):
+    """Topicni o'chirib General ga qaytaradi"""
+    chat_id = message.chat.id
+
+    if message.chat.type not in ("group", "supergroup"):
+        await message.reply("⚠️ Bu komanda faqat guruhda ishlaydi.")
+        return
+
+    if chat_id not in admin_groups:
+        await message.reply("❌ Bu guruh ro'yxatda yo'q.")
+        return
+
+    old_thread = admin_groups[chat_id]
+    admin_groups[chat_id] = None
+
+    if old_thread:
+        await message.reply(
+            f"✅ Topic (<code>{old_thread}</code>) o'chirildi.\n"
+            f"Endi leadlar <b>General</b> ga keladi.",
+            parse_mode="HTML"
+        )
+    else:
+        await message.reply("ℹ️ Topic allaqachon o'rnatilmagan, General da ishlayapti.")
+
 @dp.message_handler(commands=["status"])
 async def cmd_status(message: types.Message):
-    count       = len(admin_groups)
-    groups_text = "\n".join(f"  • <code>{g}</code>" for g in admin_groups) or "  (yo'q)"
-
     remaining = _token_cache["expires_at"] - time.time()
     if remaining > 0:
-        hours = int(remaining // 3600)
-        mins  = int((remaining % 3600) // 60)
-        token_info = f"✅ Faol (qoldi: {hours}s {mins}d)"
+        h, m = int(remaining // 3600), int((remaining % 3600) // 60)
+        token_info = f"✅ Faol (qoldi: {h}s {m}d)"
     else:
-        token_info = "❌ Muddati tugagan (keyingi so'rovda yangilanadi)"
+        token_info = "❌ Muddati tugagan"
+
+    groups_text = ""
+    for cid, tid in admin_groups.items():
+        topic = f"🧵 topic: {tid}" if tid else "📢 General"
+        groups_text += f"  • <code>{cid}</code> — {topic}\n"
+    if not groups_text:
+        groups_text = "  (yo'q)\n"
 
     await message.reply(
         f"📊 <b>Bot holati</b>\n\n"
         f"🔑 Token: {token_info}\n\n"
-        f"👥 Admin guruhlar: <b>{count}</b>\n{groups_text}\n\n"
+        f"👥 Admin guruhlar: <b>{len(admin_groups)}</b>\n{groups_text}\n"
         f"⏱ Har 1 daqiqada NEW leadlar tekshiriladi",
         parse_mode="HTML"
     )
