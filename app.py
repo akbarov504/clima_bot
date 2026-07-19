@@ -16,7 +16,7 @@ AUTH_DATA = {
     "password": "12345678"
 }
 
-BASE_URL      = "https://103-125-219-234.as-ty-cloud-xip.com/api"
+BASE_URL      = "https://74-113-233-27.as-ty-cloud-xip.com/api"
 GET_TOKEN_API = f"{BASE_URL}/auth/login"
 GET_DATA_API  = f"{BASE_URL}/company_lid/user/2"
 PATCH_API     = f"{BASE_URL}/company_lid"
